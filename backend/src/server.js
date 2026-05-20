@@ -1,64 +1,45 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { runQuery, sql } from './db.js';
+import { generateRecommendations } from './ai.js';
 
 const port = Number(process.env.PORT || 3000);
 const jwtSecret = process.env.JWT_SECRET || 'change-me-secret';
 const allowedOrigin = process.env.CORS_ORIGIN || '*';
 
+// ── JWT helpers ────────────────────────────────────────────────────────────
 function toBase64Url(input) {
-  return Buffer.from(input)
-    .toString('base64')
-    .replace(/=/g, '')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_');
+  return Buffer.from(input).toString('base64')
+    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
 }
 
 function signJwt(payload) {
-  const header = { alg: 'HS256', typ: 'JWT' };
-  const encodedHeader = toBase64Url(JSON.stringify(header));
-  const encodedPayload = toBase64Url(JSON.stringify(payload));
-  const body = `${encodedHeader}.${encodedPayload}`;
-  const signature = crypto
-    .createHmac('sha256', jwtSecret)
-    .update(body)
-    .digest('base64')
-    .replace(/=/g, '')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_');
-  return `${body}.${signature}`;
+  const header = toBase64Url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const body = `${header}.${toBase64Url(JSON.stringify(payload))}`;
+  const sig = crypto.createHmac('sha256', jwtSecret).update(body)
+    .digest('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  return `${body}.${sig}`;
 }
 
 function verifyJwt(token) {
-  const [header, payload, signature] = token.split('.');
-  if (!header || !payload || !signature) {
-    return null;
-  }
-  const expected = crypto
-    .createHmac('sha256', jwtSecret)
-    .update(`${header}.${payload}`)
-    .digest('base64')
-    .replace(/=/g, '')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_');
-
-  if (signature !== expected) {
-    return null;
-  }
-
+  const [header, payload, signature] = (token || '').split('.');
+  if (!header || !payload || !signature) return null;
+  const expected = crypto.createHmac('sha256', jwtSecret)
+    .update(`${header}.${payload}`).digest('base64')
+    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  if (signature !== expected) return null;
   const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-  if (Date.now() / 1000 > data.exp) {
-    return null;
-  }
+  if (Date.now() / 1000 > data.exp) return null;
   return data;
 }
 
+// ── HTTP helpers ───────────────────────────────────────────────────────────
 function sendJson(res, status, body) {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': allowedOrigin,
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
   });
   res.end(JSON.stringify(body));
 }
@@ -66,121 +47,204 @@ function sendJson(res, status, body) {
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
-    req.on('data', (chunk) => {
-      body += chunk;
-    });
+    req.on('data', (chunk) => { body += chunk; });
     req.on('end', () => {
-      if (!body) {
-        resolve({});
-        return;
-      }
-      try {
-        resolve(JSON.parse(body));
-      } catch {
-        reject(new Error('invalid_json'));
-      }
+      if (!body) { resolve({}); return; }
+      try { resolve(JSON.parse(body)); }
+      catch { reject(new Error('invalid_json')); }
     });
   });
 }
 
+function requireAuth(req, res) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  const payload = verifyJwt(token);
+  if (!payload) { sendJson(res, 401, { message: '인증이 필요합니다.' }); return null; }
+  return payload;
+}
+
+function rows(result) {
+  return (result ? result.split('\n') : []).filter(Boolean);
+}
+
+// ── Route table ────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
-  if (req.method === 'OPTIONS') {
-    sendJson(res, 204, {});
+  if (req.method === 'OPTIONS') { sendJson(res, 204, {}); return; }
+
+  const url = req.url?.split('?')[0] ?? '';
+  const method = req.method ?? 'GET';
+
+  // ── Health ────────────────────────────────────────────────────────────
+  if (url === '/health' && method === 'GET') {
+    try { await runQuery('SELECT 1;'); sendJson(res, 200, { status: 'ok' }); }
+    catch { sendJson(res, 500, { status: 'db_error' }); }
     return;
   }
 
-  if (req.url === '/health' && req.method === 'GET') {
-    try {
-      await runQuery('SELECT 1;');
-      sendJson(res, 200, { status: 'ok' });
-    } catch {
-      sendJson(res, 500, { status: 'db_error' });
-    }
-    return;
-  }
-
-  if (req.url === '/api/auth/login' && req.method === 'POST') {
+  // ── Auth: login ───────────────────────────────────────────────────────
+  if (url === '/api/auth/login' && method === 'POST') {
     try {
       const { username, password } = await parseBody(req);
       if (!username || !password) {
-        sendJson(res, 400, { message: 'username 과 password 는 필수입니다.' });
-        return;
+        sendJson(res, 400, { message: 'username과 password는 필수입니다.' }); return;
       }
-
       const result = await runQuery(sql`
-        SELECT id, username, display_name
-        FROM users
+        SELECT id, username, display_name FROM users
         WHERE username = ${username}
           AND password_hash = crypt(${password}, password_hash)
         LIMIT 1;
       `);
-
       if (!result) {
-        sendJson(res, 401, { message: '아이디 또는 비밀번호가 올바르지 않습니다.' });
-        return;
+        sendJson(res, 401, { message: '아이디 또는 비밀번호가 올바르지 않습니다.' }); return;
       }
-
       const [id, loginId, displayName] = result.split('\t');
       const token = signJwt({
-        sub: Number(id),
-        username: loginId,
-        displayName,
+        sub: Number(id), username: loginId, displayName,
         exp: Math.floor(Date.now() / 1000) + 60 * 60 * 8,
       });
-
-      sendJson(res, 200, {
-        token,
-        user: { id: Number(id), username: loginId, displayName },
-      });
-      return;
-    } catch {
-      sendJson(res, 500, { message: '로그인 처리 중 오류가 발생했습니다.' });
-      return;
-    }
+      sendJson(res, 200, { token, user: { id: Number(id), username: loginId, displayName } });
+    } catch { sendJson(res, 500, { message: '로그인 처리 중 오류가 발생했습니다.' }); }
+    return;
   }
 
-  if (req.url === '/api/calendar/events' && req.method === 'GET') {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-    const payload = verifyJwt(token);
-
-    if (!payload) {
-      sendJson(res, 401, { message: '토큰이 유효하지 않습니다.' });
-      return;
-    }
-
+  // ── Portfolio: list ───────────────────────────────────────────────────
+  if (url === '/api/investments' && method === 'GET') {
+    const payload = requireAuth(req, res); if (!payload) return;
     try {
       const result = await runQuery(sql`
-        SELECT id, title, category, start_at::text, end_at::text
-        FROM calendar_events
+        SELECT id, ticker, asset_name, asset_type, quantity, avg_price, currency
+        FROM investments WHERE user_id = ${payload.sub} ORDER BY created_at;
+      `);
+      const investments = rows(result).map((line) => {
+        const [id, ticker, asset_name, asset_type, quantity, avg_price, currency] = line.split('\t');
+        return { id: Number(id), ticker, asset_name, asset_type,
+                 quantity: Number(quantity), avg_price: Number(avg_price), currency };
+      });
+      sendJson(res, 200, investments);
+    } catch { sendJson(res, 500, { message: '포트폴리오 조회 실패' }); }
+    return;
+  }
+
+  // ── Portfolio: add ────────────────────────────────────────────────────
+  if (url === '/api/investments' && method === 'POST') {
+    const payload = requireAuth(req, res); if (!payload) return;
+    try {
+      const { ticker, asset_name, asset_type = 'stock', quantity, avg_price, currency = 'KRW' }
+        = await parseBody(req);
+      if (!ticker || !asset_name || quantity == null || avg_price == null) {
+        sendJson(res, 400, { message: 'ticker, asset_name, quantity, avg_price는 필수입니다.' }); return;
+      }
+      const result = await runQuery(sql`
+        INSERT INTO investments (user_id, ticker, asset_name, asset_type, quantity, avg_price, currency)
+        VALUES (${payload.sub}, ${ticker}, ${asset_name}, ${asset_type},
+                ${quantity}, ${avg_price}, ${currency})
+        RETURNING id;
+      `);
+      sendJson(res, 201, { id: Number(result.trim()) });
+    } catch { sendJson(res, 500, { message: '포트폴리오 추가 실패' }); }
+    return;
+  }
+
+  // ── Portfolio: delete ─────────────────────────────────────────────────
+  const investmentDeleteMatch = url.match(/^\/api\/investments\/(\d+)$/);
+  if (investmentDeleteMatch && method === 'DELETE') {
+    const payload = requireAuth(req, res); if (!payload) return;
+    const invId = investmentDeleteMatch[1];
+    try {
+      await runQuery(sql`
+        DELETE FROM investments WHERE id = ${invId} AND user_id = ${payload.sub};
+      `);
+      sendJson(res, 200, { message: '삭제 완료' });
+    } catch { sendJson(res, 500, { message: '삭제 실패' }); }
+    return;
+  }
+
+  // ── Calendar events: list ─────────────────────────────────────────────
+  if (url === '/api/calendar/events' && method === 'GET') {
+    const payload = requireAuth(req, res); if (!payload) return;
+    try {
+      const result = await runQuery(sql`
+        SELECT id, title, event_type, ticker, start_at::text, end_at::text,
+               notes, is_ai_recommended::text, priority, status
+        FROM investment_events
         WHERE user_id = ${payload.sub}
         ORDER BY start_at;
       `);
-
-      const rows = result ? result.split('\n') : [];
-      const events = rows.filter(Boolean).map((line) => {
-        const [id, title, category, start, end] = line.split('\t');
-        return {
-          id,
-          calendarId: '1',
-          title,
-          category,
-          start,
-          end,
-        };
+      const events = rows(result).map((line) => {
+        const [id, title, event_type, ticker, start, end, notes, is_ai, priority, status]
+          = line.split('\t');
+        return { id: Number(id), title, event_type, ticker,
+                 start: start, end: end,
+                 notes, is_ai_recommended: is_ai === 't', priority, status };
       });
-
       sendJson(res, 200, events);
-      return;
-    } catch {
-      sendJson(res, 500, { message: '캘린더 데이터를 불러오지 못했습니다.' });
-      return;
+    } catch { sendJson(res, 500, { message: '캘린더 이벤트 조회 실패' }); }
+    return;
+  }
+
+  // ── Calendar events: add ──────────────────────────────────────────────
+  if (url === '/api/calendar/events' && method === 'POST') {
+    const payload = requireAuth(req, res); if (!payload) return;
+    try {
+      const { title, event_type = 'general', ticker = null, start, end,
+              notes = null, is_ai_recommended = false, priority = 'MEDIUM' }
+        = await parseBody(req);
+      if (!title || !start || !end) {
+        sendJson(res, 400, { message: 'title, start, end는 필수입니다.' }); return;
+      }
+      const result = await runQuery(sql`
+        INSERT INTO investment_events
+          (user_id, title, event_type, ticker, start_at, end_at, notes, is_ai_recommended, priority)
+        VALUES
+          (${payload.sub}, ${title}, ${event_type}, ${ticker ?? ''},
+           ${start}, ${end}, ${notes ?? ''},
+           ${is_ai_recommended ? 'true' : 'false'}, ${priority})
+        RETURNING id;
+      `);
+      sendJson(res, 201, { id: Number(result.trim()) });
+    } catch { sendJson(res, 500, { message: '이벤트 추가 실패' }); }
+    return;
+  }
+
+  // ── Calendar events: delete ───────────────────────────────────────────
+  const eventDeleteMatch = url.match(/^\/api\/calendar\/events\/(\d+)$/);
+  if (eventDeleteMatch && method === 'DELETE') {
+    const payload = requireAuth(req, res); if (!payload) return;
+    const evId = eventDeleteMatch[1];
+    try {
+      await runQuery(sql`
+        DELETE FROM investment_events WHERE id = ${evId} AND user_id = ${payload.sub};
+      `);
+      sendJson(res, 200, { message: '삭제 완료' });
+    } catch { sendJson(res, 500, { message: '삭제 실패' }); }
+    return;
+  }
+
+  // ── AI recommendations ────────────────────────────────────────────────
+  if (url === '/api/ai/recommend' && method === 'POST') {
+    const payload = requireAuth(req, res); if (!payload) return;
+    try {
+      const result = await runQuery(sql`
+        SELECT ticker, asset_name, asset_type, quantity, avg_price, currency
+        FROM investments WHERE user_id = ${payload.sub} ORDER BY created_at;
+      `);
+      const portfolio = rows(result).map((line) => {
+        const [ticker, asset_name, asset_type, quantity, avg_price, currency] = line.split('\t');
+        return { ticker, asset_name, asset_type,
+                 quantity: Number(quantity), avg_price: Number(avg_price), currency };
+      });
+      const data = await generateRecommendations(portfolio);
+      sendJson(res, 200, data);
+    } catch (err) {
+      sendJson(res, 500, { message: 'AI 추천 생성 실패: ' + err.message });
     }
+    return;
   }
 
   sendJson(res, 404, { message: 'Not found' });
 });
 
 server.listen(port, () => {
-  console.log(`Backend API listening on port ${port}`);
+  console.log(`Investment Advisor API listening on port ${port}`);
 });
